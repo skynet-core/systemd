@@ -1,0 +1,19 @@
+FROM archlinux:latest AS systemd
+
+# archlinux:latest already ships systemd + the /usr/sbin/init symlink, so we
+# only add the message bus and the polkit authorizer, then drop the cache.
+RUN pacman -Syu --noconfirm --needed \
+        systemd \
+        dbus \
+        polkit \
+    && pacman -Scc --noconfirm
+
+STOPSIGNAL SIGRTMIN+3
+
+COPY /init.d /init.d
+
+ENV MODULE_SYSTEMD_ENABLED=true
+
+ENTRYPOINT [ "/init.d/init.sh" ]
+
+CMD [ "/usr/sbin/init", "--system" ]

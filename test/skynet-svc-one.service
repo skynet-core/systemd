@@ -1,0 +1,12 @@
+[Unit]
+Description=Skynet fixture service one
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'echo "skynet-svc-one started"; while :; do sleep 3600; done'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=skynet-custom.target

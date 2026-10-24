@@ -1,0 +1,22 @@
+FROM debian:13 AS systemd
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd \
+        dbus-broker \
+        dbus-daemon \
+        ca-certificates \
+        polkitd \
+    && rm -rf /var/lib/apt/lists/*
+
+STOPSIGNAL SIGRTMIN+3
+
+COPY /init.d /init.d
+
+ENV MODULE_SYSTEMD_ENABLED=true
+
+ENTRYPOINT [ "/init.d/init.sh" ]
+
+CMD [ "/usr/sbin/init", "--system" ]

@@ -1,0 +1,32 @@
+FROM fedora:44 AS systemd
+
+RUN cat <<EOF > /etc/dnf/dnf.conf
+[main]
+tsflags=nodocs
+fastestmirror=True
+max_parallel_downloads=10
+gpgcheck=True
+installonly_limit=3
+clean_requirements_on_remove=True
+best=False
+skip_if_unavailable=True
+EOF
+
+RUN dnf up -y
+
+RUN dnf install -y \
+    systemd \
+    dbus-broker \
+    dbus-daemon \
+    polkit \
+    && dnf clean all
+
+STOPSIGNAL SIGRTMIN+3
+
+COPY /init.d /init.d
+
+ENV MODULE_SYSTEMD_ENABLED=true
+
+ENTRYPOINT [ "/init.d/init.sh" ]
+
+CMD [ "/usr/sbin/init", "--system" ]

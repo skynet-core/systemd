@@ -1,0 +1,6 @@
+[Unit]
+Description=Skynet custom init target (test fixture)
+After=network.target
+
+[Install]
+WantedBy=multi-user.target
