@@ -9,8 +9,8 @@
 #
 # Each test:
 #   - launches a detached container with --privileged --ipc=host
-#   - mounts ./test as /etc/systemd/system so fixture units are visible
-#   - sets SYSTEMD_INIT_TARGET and/or SYSTEMD_INIT_TARGET_WANTS
+#   - mounts fixture units into systemd's unit search paths
+#   - sets SYSTEMD_INIT_TARGET, SYSTEMD_INIT_TARGET_WANTS and/or SYSTEMD_MASKED
 #   - waits for the target to become active (up to WAIT_TIMEOUT seconds)
 #   - runs test/verify.sh via `exec` to assert target + services + symlinks
 #   - always tears the container down (docker rm -f)
@@ -77,8 +77,8 @@ start_container() {
         --privileged --ipc=host \
         --tmpfs /tmp:rw,size=64m \
         -v "${TEST_DIR}/skynet-custom.target:/etc/systemd/system/skynet-custom.target:ro" \
-        -v "${TEST_DIR}/skynet-svc-one.service:/etc/systemd/system/skynet-svc-one.service:ro" \
-        -v "${TEST_DIR}/skynet-svc-two.service:/etc/systemd/system/skynet-svc-two.service:ro" \
+        -v "${TEST_DIR}/skynet-svc-one.service:/usr/lib/systemd/system/skynet-svc-one.service:ro" \
+        -v "${TEST_DIR}/skynet-svc-two.service:/usr/lib/systemd/system/skynet-svc-two.service:ro" \
         -v "${SCRIPT_DIR}:/opt/skynet-test:ro" \
         "${env_flags[@]}" \
         "${IMAGE_TAG}" \
@@ -154,14 +154,29 @@ run_test() {
         "$RUNTIME_BIN" logs --tail 80 "$id" 2>&1 | sed 's/^/[logs] /' >&2
         rc=1
     else
-        if ! "$RUNTIME_BIN" exec \
-            -e SYSTEMD_INIT_TARGET="$target" \
-            -e SYSTEMD_INIT_TARGET_WANTS="$wants" \
-            "$id" /opt/skynet-test/verify.sh; then
-            bad "$label — verify.sh reported failures"
-            dump_container_state "$id" "$target"
-            rc=1
-        fi
+        local phase
+        for phase in boot restart; do
+            if [[ "$phase" == restart ]]; then
+                [[ "$*" == *SYSTEMD_MASKED=* ]] || break
+                info "[$label] restarting to check persistent masks"
+                if ! "$RUNTIME_BIN" restart "$id" >/dev/null || ! wait_for_active "$id" "$target"; then
+                    bad "$label — target '$target' did not become active after restart"
+                    dump_container_state "$id" "$target"
+                    rc=1
+                    break
+                fi
+            fi
+            info "[$label] verifying after $phase"
+            if ! "$RUNTIME_BIN" exec \
+                -e SYSTEMD_INIT_TARGET="$target" \
+                -e SYSTEMD_INIT_TARGET_WANTS="$wants" \
+                "$id" /opt/skynet-test/verify.sh; then
+                bad "$label — verify.sh reported failures"
+                dump_container_state "$id" "$target"
+                rc=1
+                break
+            fi
+        done
     fi
 
     teardown "$id"
@@ -271,6 +286,11 @@ esac
 #  5. Bare service names (no `.service` extension).
 #  6. Unknown target — entrypoint must die fast with a recognizable error.
 #  7. Unknown wanted service — target still boots, warning logged.
+#  8. Masking wins over wants, leaving other services active.
+#  9. Multiple masks accept commas, spaces and bare service names.
+# 10. Masking a local unit fails without replacing its unit file.
+# 11. A derived image runs the real NetworkManager package without a mask.
+# 12. Enabled NetworkManager is disabled and masked before and after restart.
 
 run_test "custom target is default (no wants)" \
     "skynet-custom.target" "" \
@@ -303,6 +323,51 @@ run_test "unknown wanted service (warning, target still active)" \
     "skynet-custom.target" "skynet-svc-one.service" \
     -e SYSTEMD_INIT_TARGET=skynet-custom.target \
     -e SYSTEMD_INIT_TARGET_WANTS="skynet-svc-one.service,does-not-exist.service"
+
+run_test "masked service wins over wants" \
+    "skynet-custom.target" "skynet-svc-one.service" \
+    -e SYSTEMD_INIT_TARGET=skynet-custom.target \
+    -e SYSTEMD_INIT_TARGET_WANTS="skynet-svc-one.service skynet-svc-two.service" \
+    -e SYSTEMD_MASKED=skynet-svc-two.service
+
+run_test "two masks (comma-separated paths)" \
+    "skynet-custom.target" "" \
+    -e SYSTEMD_INIT_TARGET=skynet-custom.target \
+    -e SYSTEMD_INIT_TARGET_WANTS="skynet-svc-one.service skynet-svc-two.service" \
+    -e SYSTEMD_MASKED="/usr/lib/systemd/system/skynet-svc-one.service,/usr/lib/systemd/system/skynet-svc-two.service"
+
+run_test "two masks (space-separated bare names)" \
+    "skynet-custom.target" "" \
+    -e SYSTEMD_INIT_TARGET=skynet-custom.target \
+    -e SYSTEMD_INIT_TARGET_WANTS="/usr/lib/systemd/system/skynet-svc-one.service /usr/lib/systemd/system/skynet-svc-two.service" \
+    -e SYSTEMD_MASKED="skynet-svc-one skynet-svc-two"
+
+run_fail_test "masking a local unit preserves its file (expect fail-fast)" \
+    "Could not mask SYSTEMD_MASKED units" \
+    -e SYSTEMD_INIT_TARGET=skynet-custom.target \
+    -e SYSTEMD_MASKED=skynet-custom.target
+
+networkmanager_image="${IMAGE_TAG}-networkmanager"
+info "building ${networkmanager_image} with NetworkManager installed and enabled"
+if ! "$RUNTIME_BIN" build \
+    --file "${SCRIPT_DIR}/Dockerfile.network-manager" \
+    --build-arg "BASE_IMAGE=${IMAGE_TAG}" \
+    --tag "$networkmanager_image" \
+    "$CONTEXT"; then
+    bad "NetworkManager test image build failed"
+    exit 1
+fi
+
+IMAGE_TAG="$networkmanager_image" run_test "NetworkManager runs without a mask" \
+    "skynet-custom.target" "NetworkManager.service skynet-svc-one.service" \
+    -e SYSTEMD_INIT_TARGET=skynet-custom.target \
+    -e SYSTEMD_INIT_TARGET_WANTS="NetworkManager.service skynet-svc-one.service"
+
+IMAGE_TAG="$networkmanager_image" run_test "enabled NetworkManager is disabled and masked" \
+    "skynet-custom.target" "skynet-svc-one.service" \
+    -e SYSTEMD_INIT_TARGET=skynet-custom.target \
+    -e SYSTEMD_INIT_TARGET_WANTS="NetworkManager.service skynet-svc-one.service" \
+    -e SYSTEMD_MASKED=NetworkManager.service
 
 # ---------------------------------------------------------------------------
 # Summary

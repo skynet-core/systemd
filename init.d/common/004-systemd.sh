@@ -13,14 +13,14 @@ normalize_unit_name() {
 	esac
 }
 
-# Resolve a unit name to an existing unit file path.
+# Resolve a unit name to an existing unit file path, including /dev/null masks.
 #   $1 = unit name (bare name, e.g. "custom.target")
 #   $2 = extension to append when the name has none
 resolve_unit() {
 	local name="$1" ext="$2" candidate sp full
 
 	if [[ "$name" == */* ]]; then
-		if [[ -f "$name" ]]; then
+		if [[ -f "$name" || "$name" -ef /dev/null ]]; then
 			printf '%s' "$name"
 			return 0
 		fi
@@ -31,7 +31,7 @@ resolve_unit() {
 
 	for sp in "${UNIT_SEARCH_PATHS[@]}"; do
 		candidate="${sp}/${full}"
-		if [[ -f "$candidate" ]]; then
+		if [[ -f "$candidate" || "$candidate" -ef /dev/null ]]; then
 			printf '%s' "$candidate"
 			return 0
 		fi

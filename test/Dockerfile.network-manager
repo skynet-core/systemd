@@ -1,0 +1,18 @@
+ARG BASE_IMAGE=systemd:local-test
+FROM ${BASE_IMAGE}
+
+RUN . /etc/os-release \
+    && case "$ID" in \
+        fedora) \
+            dnf install -y NetworkManager && dnf clean all ;; \
+        debian|ubuntu) \
+            apt-get update \
+            && apt-get install -y --no-install-recommends network-manager \
+            && rm -rf /var/lib/apt/lists/* ;; \
+        arch) \
+            pacman -Syu --noconfirm --needed networkmanager \
+            && pacman -Scc --noconfirm ;; \
+        *) exit 1 ;; \
+    esac \
+    && systemctl --root=/ enable NetworkManager.service \
+    && systemctl --root=/ is-enabled NetworkManager.service

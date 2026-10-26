@@ -5,6 +5,7 @@
 # Expects these env vars (they are the SAME ones passed to `run`):
 #   SYSTEMD_INIT_TARGET          target that should be active now
 #   SYSTEMD_INIT_TARGET_WANTS    space- or comma-separated services to check
+#   SYSTEMD_MASKED               space- or comma-separated units to check
 #
 # Prints a summary prefixed with [verify] and exits 0 on success, 1 on failure.
 set -uo pipefail
@@ -60,9 +61,36 @@ check_symlinks() {
   fi
 }
 
+check_masked() {
+  local item name state enabled_link start_output
+  local -a masks
+  IFS=', ' read -r -a masks <<< "${SYSTEMD_MASKED:-}"
+  for item in "${masks[@]}"; do
+    [[ -z "$item" ]] && continue
+    name="$(systemctl show --property=Id --value "${item##*/}")"
+    state="$(systemctl is-enabled "$name" 2>&1)"
+    log "  masked: $name => $state"
+    [[ "$state" == "masked" ]] || fail "$name is not masked (state=$state)"
+    state="$(systemctl is-active "$name" 2>&1)"
+    log "  active state: $name => $state"
+    [[ "$state" == "inactive" ]] || fail "$name is active"
+    [[ "$(readlink "/etc/systemd/system/$name")" == "/dev/null" ]] || fail "$name has no mask symlink"
+    enabled_link="$(find /etc/systemd/system -mindepth 2 -type l -name "$name" -print -quit)"
+    [[ -z "$enabled_link" ]] || fail "$name is still enabled: $enabled_link"
+    log "  no enablement links remain for $name"
+    grep -Fxq "disable $name" /etc/systemd/system-preset/00-systemd-masked.preset || fail "$name has no disable preset"
+    if start_output="$(systemctl start "$name" 2>&1)"; then
+      fail "$name could still be started"
+    fi
+    log "  start rejected: $start_output"
+    [[ "$start_output" == *masked* ]] || fail "$name start failed for another reason"
+  done
+}
+
 check_target
 if [[ -n "$WANTS" ]]; then check_services; fi
 check_symlinks
+check_masked
 
 echo "=== VERIFY RESULT: PASS ==="
 echo "  target:         $TARGET => $(systemctl is-active "$TARGET")"

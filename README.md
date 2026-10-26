@@ -2,8 +2,9 @@
 
 A family of base images — **Fedora 44**, **Debian 13 (trixie)**, **Ubuntu 26.04**,
 and **Arch Linux** — that run **systemd as PID 1** and let you
-choose a **custom default init target** and enable a set of **services** via
-environment variables — no need to rebuild the image per deployment.
+choose a **custom default init target**, enable **services**, and disable and
+mask unwanted units via environment variables — no need to rebuild the image
+per deployment.
 
 The entrypoint is a small, **extensible init framework** rather than a single
 hard-coded script. It is designed to be used as the base of a family of
@@ -28,7 +29,7 @@ same lifecycle, logging, and hook behaviour.
 │   │   ├── 003-print.sh       #   debug / info / warn / error / die + INIT_LOG_LEVEL
 │   │   └── 004-systemd.sh     #   unit-name normalisation + resolve_unit
 │   └── modules/               # one file per init phase (loaded + run in order)
-│       ├── 501-systemd.sh     #   configure default.target / .wants (systemd)
+│       ├── 501-systemd.sh     #   configure default.target / .wants / masks
 │       └── 999-exec.sh        #   hand over PID 1: exec "$@"
 ├── test/                      # test suite + fixture units
 └── .github/
@@ -66,7 +67,7 @@ becomes PID 1** and receives signals such as `SIGRTMIN+3`
 
 | Module | Enabled when | What it does |
 | --- | --- | --- |
-| `systemd` (`501-systemd.sh`) | `MODULE_SYSTEMD_ENABLED` is true | Links `SYSTEMD_INIT_TARGET` as `default.target` and enables `SYSTEMD_INIT_TARGET_WANTS` into the `.wants` dirs. |
+| `systemd` (`501-systemd.sh`) | `MODULE_SYSTEMD_ENABLED` is true | Links `SYSTEMD_INIT_TARGET` as `default.target`, disables and masks `SYSTEMD_MASKED`, and enables `SYSTEMD_INIT_TARGET_WANTS` into the `.wants` dirs. |
 | `exec` (`999-exec.sh`) | always | `exec "$@"` — hands PID 1 to the `CMD` (systemd). |
 
 ### Module contract
@@ -105,18 +106,29 @@ the container log driver and never pollutes stdout used by `exec`.
 | `MODULE_SYSTEMD_ENABLED` | `false` | Gate for the `systemd` module. Set to `true` (or `1`/`yes`/`on`) to configure init. |
 | `SYSTEMD_INIT_TARGET` | — | Unit to boot as the default target. Linked to `/etc/systemd/system/default.target`. A missing `.target` extension is assumed. |
 | `SYSTEMD_INIT_TARGET_WANTS` | — | Comma- and/or space separated list of services to enable into `default.target.wants/`. A missing `.service` extension is assumed. Unknown units are skipped with a warning. |
-| `SYSTEMD_SYSTEM_DIR` | `/etc/systemd/system` | Base dir for the symlinks above (overridable for tests). |
+| `SYSTEMD_MASKED` | — | Comma- and/or space separated list of units to disable via systemd presets and mask before boot. A missing `.service` extension is assumed. Unknown units are skipped with a warning. Takes precedence over `SYSTEMD_INIT_TARGET_WANTS`. |
+| `SYSTEMD_SYSTEM_DIR` | `/etc/systemd/system` | Base dir for the target and wants symlinks (overridable for tests). |
 | `DEFAULT_TARGET_LINK` | `$SYSTEMD_SYSTEM_DIR/default.target` | Where the default-target symlink is written. |
 | `INIT_LOG_LEVEL` | `2` | `0` errors, `1` +warn, `2` +info, `3` +debug. |
 
-`SYSTEMD_INIT_TARGET` and `SYSTEMD_INIT_TARGET_WANTS` each accept a bare name
-(`mysvc`), a full unit name (`mysvc.target` / `mysvc.service`), or an absolute
-path to a unit file.
+`SYSTEMD_INIT_TARGET`, `SYSTEMD_INIT_TARGET_WANTS`, and `SYSTEMD_MASKED` each
+accept a bare name (`mysvc`), a full unit name (`mysvc.target` / `mysvc.service`),
+or an absolute path to a unit file.
 
 > **Note:** when `SYSTEMD_INIT_TARGET` points at a custom target, the `systemd`
 > module also mirrors the `SYSTEMD_INIT_TARGET_WANTS` symlinks into
-> `<custom>.target.wants/` so the units are guaranteed to start regardless of
+> `<custom>.target.wants/` so enabled units start regardless of
 > which target is active.
+
+For example, `-e SYSTEMD_MASKED="systemd-logind.service,getty@.service"`
+writes `disable` rules to `/etc/systemd/system-preset/00-systemd-masked.preset`,
+applies them with `systemctl --root=/ --preset-mode=disable-only preset`, and
+masks the units with symlinks to `/dev/null`. Presets alone only control
+enablement; masking also prevents dependency and manual activation.
+Both steps run before systemd starts and leave unrelated units alone.
+Existing unit files in `/etc/systemd/system` are preserved: masking one fails
+startup rather than replacing its contents. Masks persist in the container's
+filesystem; removing the variable does not unmask previously masked units.
 
 ## Build
 
@@ -218,6 +230,15 @@ A complete test suite lives in `test/` and proves that:
 4. Bare names (no extension) and both comma- and space-separated lists work.
 5. An unknown target fails fast with a clear error (container exits non-zero).
 6. An unknown wanted service is skipped with a warning while the rest still boot.
+7. `SYSTEMD_MASKED` creates disable presets and masks, prevents activation even
+   for wanted units across restarts, and accepts comma- and space-separated lists
+   and bare names.
+8. Masking a local unit fails without overwriting its unit file.
+9. A derived test image installs and enables the real NetworkManager package.
+   A control container proves it runs without a mask; a masked container proves
+   its enablement links are removed, it stays inactive, and manual starts fail
+   both before and after a container restart. An unrelated fixture service stays
+   active in both containers.
 
 Run all tests (defaults to Fedora):
 
@@ -238,14 +259,16 @@ Useful options:
 | `RUNTIME` | `docker` | `podman` to test against podman instead. |
 | `DOCKERFILE` | `Dockerfile.fedora-44` | Path to the distro's Dockerfile. |
 | `IMAGE_TAG` | `systemd:local-test` | Local tag to build/test. |
-| `SKIP_BUILD` | `false` | `true` to skip the build step (image already exists). |
+| `SKIP_BUILD` | `false` | `true` to skip the base image build (image already exists). The derived NetworkManager test image is still built. |
 | `WAIT_TIMEOUT` | `90` | Seconds to wait for the target to become active. |
 
 The harness uses `docker/podman run --privileged --ipc=host` (as requested),
-mounts the fixture units into `/etc/systemd/system`, starts each container
+mounts the fixture units into systemd's unit search paths, starts each container
 detached, waits for the target to become active, runs `test/verify.sh` inside
 the live container to assert target + service + symlink state, and always tears
 the container down. A final summary reports pass/fail counts.
+The NetworkManager test image uses the `${IMAGE_TAG}-networkmanager` tag and is
+built locally for each distro; NetworkManager is only added to this test image.
 
 ### Test fixtures
 
@@ -253,6 +276,8 @@ the container down. A final summary reports pass/fail counts.
 * `test/skynet-svc-one.service`, `test/skynet-svc-two.service` — long-running
   fixture services used to prove `SYSTEMD_INIT_TARGET_WANTS`.
 * `test/verify.sh` — in-container assertions (run via `docker/podman exec`).
+* `test/Dockerfile.network-manager` — derived test image with NetworkManager
+  installed and enabled using the distro's package manager.
 * `test/host_verify_links.sh` — optional host-side symlink inspection helper.
 
 ## CI / Publishing

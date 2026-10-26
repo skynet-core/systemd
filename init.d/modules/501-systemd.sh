@@ -15,6 +15,11 @@
 #       extension is assumed. Units that cannot be found are skipped with
 #       a warning (so a typo never blocks boot).
 #
+#   SYSTEMD_MASKED
+#       Comma- and/or space separated list of units to disable via presets
+#       and mask before boot. A missing ".service" extension is assumed.
+#       Units that cannot be found are skipped with a warning.
+#
 # After configuration the entrypoint hands the PID 1 slot to systemd via
 # `exec`, so all signals (e.g. SIGRTMIN+3 / STOPSIGNAL) reach systemd.
 #
@@ -89,6 +94,10 @@ module_systemd_run() {
 				}
 
 			link_name="$(basename "$svc_src")"
+			if [[ "$svc_src" -ef /dev/null || "${SYSTEMD_SYSTEM_DIR}/${link_name}" -ef /dev/null ]]; then
+				warn "wanted unit '${item}' is masked; skipping"
+				continue
+			fi
 
 			ln -sfn "$svc_src" "${PRIMARY_WANTS_DIR}/${link_name}"
 			info "enabled ${link_name} in default.target.wants -> ${svc_src}"
@@ -106,5 +115,33 @@ module_systemd_run() {
 		fi
 	else
 		info "SYSTEMD_INIT_TARGET_WANTS not set; leaving .wants dirs untouched"
+	fi
+
+	# ---------------------------------------------------------------------------
+	# 3. SYSTEMD_MASKED - disable units via presets, then prevent activation.
+	# ---------------------------------------------------------------------------
+	if [[ -n "${SYSTEMD_MASKED:-}" ]]; then
+		local -a mask_items masked_units=()
+		local mask_src preset_file="/etc/systemd/system-preset/00-systemd-masked.preset"
+		IFS=', ' read -r -a mask_items <<<"${SYSTEMD_MASKED}"
+		for item in "${mask_items[@]}"; do
+			[[ -z "$item" ]] && continue
+			mask_src="$(resolve_unit "$item" ".service")" ||
+				{
+					warn "masked unit '${item}' not found; skipping"
+					continue
+				}
+			masked_units+=("$(basename "$mask_src")")
+		done
+
+		if ((${#masked_units[@]})); then
+			mkdir -p "${preset_file%/*}"
+			printf 'disable %s\n' "${masked_units[@]}" >"$preset_file"
+			systemctl --root=/ --preset-mode=disable-only preset -- "${masked_units[@]}" ||
+				die "Could not apply SYSTEMD_MASKED presets"
+			systemctl --root=/ mask -- "${masked_units[@]}" ||
+				die "Could not mask SYSTEMD_MASKED units"
+			info "disabled and masked ${masked_units[*]}"
+		fi
 	fi
 }
